@@ -4,13 +4,12 @@
 #include <HardwareSerial.h>
 
 // ---------- WiFi config — EDIT THESE ----------
-const char* WIFI_SSID = "Airtel_Aaravgoel";
-const char* WIFI_PASSWORD = "27112017";
-const char* LAPTOP_IP = "10.73.242.225";
+const char* WIFI_SSID = "Krish";
+const char* WIFI_PASSWORD = "bhandara";
+const char* LAPTOP_IP = "172.20.10.3";
 const int UDP_PORT = 5005;
 
 WiFiUDP udp;
-  
 WebServer server(80);
 
 // ---------- Stepper (DRV8825) ----------
@@ -21,16 +20,16 @@ const int STEPS_PER_REV = 200;     // standard NEMA17 full-step count
 const int MICROSTEP = 16;          // matches the 1/16 (MS1=0,MS2=0,MS3=1) config discussed earlier
 const float STEPS_PER_DEGREE = (STEPS_PER_REV * MICROSTEP) / 360.0;  // ≈ 8.89 at 1/16
 
-const unsigned long STEP_INTERVAL_US = 800;  // time between individual step pulses — tune for speed vs torque
+const unsigned long STEP_INTERVAL_US = 1600;  // time between individual step pulses — tune for speed vs torque
 
 long currentStepPosition = 0;
 long targetStepPosition = 0;
 unsigned long lastStepMicros = 0;
 
 int panStart = 0;
-int panEnd = 180;      // stepper CAN go further, but stays at 180 by default — see note below
-int panStep = 2;
-unsigned long stepDelayMs = 300;
+int panEnd = 360;      // stepper CAN go further, but stays at 180 by default — see note below
+float panStep = 0.5;
+unsigned long stepDelayMs = 500;
 
 float currentAngleDeg = 0;
 int panDirection = 1;
@@ -57,11 +56,17 @@ int batchCount = 0;
 
 unsigned long totalPacketsSent = 0;
 unsigned long totalSamplesRead = 0;
+unsigned long totalSamplesRejectedMoving = 0;   // NEW: track how many got dropped for motion
 unsigned long bootTime = 0;
 
 // ---------- Stepper: non-blocking target-following ----------
 void setTargetAngle(float angleDeg) {
   targetStepPosition = (long)round(angleDeg * STEPS_PER_DEGREE);
+}
+
+// NEW: true only when the stepper has actually reached its target and stopped
+bool stepperSettled() {
+  return currentStepPosition == targetStepPosition;
 }
 
 void updateStepper() {
@@ -184,9 +189,9 @@ const char* PAGE_HTML = R"rawliteral(
   <div class="card">
     <h3 style="margin-top:0; color:#ddd;">Sweep Parameters</h3>
     <div class="paramRow"><span>Pan Start (deg)</span><input type="number" id="panStart" value="0"></div>
-    <div class="paramRow"><span>Pan End (deg)</span><input type="number" id="panEnd" value="180"></div>
-    <div class="paramRow"><span>Pan Step (deg)</span><input type="number" id="panStep" value="2"></div>
-    <div class="paramRow"><span>Step Delay (ms)</span><input type="number" id="stepDelay" value="300"></div>
+    <div class="paramRow"><span>Pan End (deg)</span><input type="number" id="panEnd" value="360"></div>
+    <div class="paramRow"><span>Pan Step (deg)</span><input type="number" step="0.1" id="panStep" value="0.5"></div>
+    <div class="paramRow"><span>Step Delay (ms)</span><input type="number" id="stepDelay" value="500"></div>
     <button onclick="applyParams()">Apply</button>
   </div>
   <div class="card">
@@ -194,6 +199,7 @@ const char* PAGE_HTML = R"rawliteral(
     <div class="stat"><span>Pan range:</span><span id="rangeVal">--</span></div>
     <div class="stat"><span>WiFi RSSI:</span><span id="rssiVal">--</span></div>
     <div class="stat"><span>Samples read:</span><span id="samplesVal">--</span></div>
+    <div class="stat"><span>Rejected (moving):</span><span id="rejectedVal">--</span></div>
     <div class="stat"><span>Packets sent:</span><span id="packetsVal">--</span></div>
     <div class="stat"><span>Uptime:</span><span id="uptimeVal">--</span></div>
   </div>
@@ -217,6 +223,7 @@ const char* PAGE_HTML = R"rawliteral(
         document.getElementById('rangeVal').innerText = d.panStart + '-' + d.panEnd + ' step ' + d.panStep;
         document.getElementById('rssiVal').innerText = d.rssi + ' dBm';
         document.getElementById('samplesVal').innerText = d.samples;
+        document.getElementById('rejectedVal').innerText = d.rejectedMoving;
         document.getElementById('packetsVal').innerText = d.packets;
         document.getElementById('uptimeVal').innerText = d.uptime + 's';
         if (d.mode === 'auto') document.getElementById('angleSlider').value = d.angle;
@@ -255,13 +262,13 @@ void handleSetMode() {
 void handleSetSweepParams() {
   if (server.hasArg("panStart")) panStart = server.arg("panStart").toInt();
   if (server.hasArg("panEnd")) panEnd = server.arg("panEnd").toInt();
-  if (server.hasArg("panStep")) panStep = server.arg("panStep").toInt();
+  if (server.hasArg("panStep")) panStep = server.arg("panStep").toFloat();   // was toInt() — truncated 0.5 to 0
   if (server.hasArg("stepDelay")) stepDelayMs = server.arg("stepDelay").toInt();
 
   if (panStart < 0) panStart = 0;
   if (panEnd > 360) panEnd = 360;   // stepper can go further than a servo's 180 — see note below
   if (panStart >= panEnd) panEnd = panStart + 1;
-  if (panStep < 1) panStep = 1;
+  if (panStep < 0.1) panStep = 0.1;
   if (stepDelayMs < 20) stepDelayMs = 20;
 
   server.send(200, "text/plain", "OK");
@@ -277,6 +284,7 @@ void handleStatus() {
   json += "\"stepDelay\":" + String(stepDelayMs) + ",";
   json += "\"rssi\":" + String(WiFi.RSSI()) + ",";
   json += "\"samples\":" + String(totalSamplesRead) + ",";
+  json += "\"rejectedMoving\":" + String(totalSamplesRejectedMoving) + ",";
   json += "\"packets\":" + String(totalPacketsSent) + ",";
   json += "\"uptime\":" + String((millis() - bootTime) / 1000);
   json += "}";
@@ -349,7 +357,15 @@ void loop() {
 
   while (readScanSample(angle_deg, distance_mm, quality)) {
     totalSamplesRead++;
+
     if (distance_mm >= 80 && distance_mm <= 12000 && quality >= 10) {
+      if (!stepperSettled()) {
+        // Stepper is still moving toward its target — this sample's tagged angle
+        // wouldn't accurately reflect where the lidar physically is right now.
+        totalSamplesRejectedMoving++;
+        continue;
+      }
+
       batchBuffer[batchCount].angle_deg = angle_deg;
       batchBuffer[batchCount].distance_mm = distance_mm;
       batchBuffer[batchCount].quality = quality;
